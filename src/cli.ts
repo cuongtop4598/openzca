@@ -7481,6 +7481,544 @@ program
   );
 
 // ---------------------------------------------------------------------------
+// Gmail inbox polling → Zalo forwarding
+// ---------------------------------------------------------------------------
+
+import {
+  readGmailConfig,
+  writeGmailConfig,
+  readGmailPollState,
+  writeGmailPollState,
+  refreshAccessToken,
+  listNewMessages,
+  getMessage,
+  markAsRead,
+  getGmailConfigPath,
+  type GmailConfig,
+  type GmailRoute,
+  type GmailOAuthConfig,
+  type ParsedEmail,
+} from "./lib/gmail.js";
+import {
+  validateEmail,
+  findMatchingRoutes,
+  formatEmailForZalo,
+  generateRouteId,
+  type ValidationResult,
+} from "./lib/gmail-filter.js";
+
+const gmail = program
+  .command("gmail")
+  .description("Gmail inbox polling and auto-forward to Zalo groups/users");
+
+gmail
+  .command("setup")
+  .requiredOption("--client-id <id>", "Google OAuth2 client ID")
+  .requiredOption("--client-secret <secret>", "Google OAuth2 client secret")
+  .requiredOption("--refresh-token <token>", "Google OAuth2 refresh token")
+  .option("--poll-interval <ms>", "Poll interval in ms (default 300000 = 5 min)")
+  .option("--max-per-poll <n>", "Max emails per poll (default 10)")
+  .option("-j, --json", "JSON output")
+  .description("Configure Gmail OAuth2 credentials for the active profile")
+  .action(
+    wrapAction(async (
+      opts: {
+        clientId: string;
+        clientSecret: string;
+        refreshToken: string;
+        pollInterval?: string;
+        maxPerPoll?: string;
+        json?: boolean;
+      },
+      command: Command,
+    ) => {
+      const profile = await currentProfile(command);
+      const existing = await readGmailConfig(profile);
+
+      const config: GmailConfig = {
+        oauth: {
+          clientId: opts.clientId,
+          clientSecret: opts.clientSecret,
+          refreshToken: opts.refreshToken,
+        },
+        routes: existing?.routes ?? [],
+        pollIntervalMs: opts.pollInterval ? Number(opts.pollInterval) : existing?.pollIntervalMs ?? 300_000,
+        maxEmailsPerPoll: opts.maxPerPoll ? Number(opts.maxPerPoll) : existing?.maxEmailsPerPoll ?? 10,
+        updatedAt: new Date().toISOString(),
+      };
+
+      // Verify credentials by refreshing the token
+      try {
+        const refreshed = await refreshAccessToken(config.oauth);
+        config.oauth = refreshed;
+        console.error("Gmail OAuth credentials verified successfully.");
+      } catch (error) {
+        console.error(`Warning: Could not verify credentials: ${error instanceof Error ? error.message : String(error)}`);
+      }
+
+      await writeGmailConfig(profile, config);
+      output(
+        {
+          profile,
+          configPath: getGmailConfigPath(profile),
+          pollIntervalMs: config.pollIntervalMs,
+          maxEmailsPerPoll: config.maxEmailsPerPoll,
+          routeCount: config.routes.length,
+          status: "configured",
+        },
+        shouldOutputJson(opts),
+      );
+    }),
+  );
+
+gmail
+  .command("status")
+  .option("-j, --json", "JSON output")
+  .description("Show Gmail configuration status and routes")
+  .action(
+    wrapAction(async (opts: { json?: boolean }, command: Command) => {
+      const profile = await currentProfile(command);
+      const config = await readGmailConfig(profile);
+      const state = await readGmailPollState(profile);
+
+      if (!config) {
+        output({ profile, status: "not_configured", message: "Run 'gmail setup' first" }, shouldOutputJson(opts));
+        return;
+      }
+
+      output(
+        {
+          profile,
+          status: "configured",
+          pollIntervalMs: config.pollIntervalMs,
+          maxEmailsPerPoll: config.maxEmailsPerPoll,
+          routeCount: config.routes.length,
+          routes: config.routes.map((r) => ({
+            id: r.id,
+            name: r.name,
+            enabled: r.enabled,
+            target: r.target,
+            filters: r.filters,
+          })),
+          lastPollAt: state.lastPollAtMs ? new Date(state.lastPollAtMs).toISOString() : "never",
+          processedCount: state.processedMessageIds.length,
+        },
+        shouldOutputJson(opts),
+      );
+    }),
+  );
+
+gmail
+  .command("add-route")
+  .requiredOption("--name <name>", "Route name")
+  .requiredOption("--target <threadId>", "Zalo thread ID to forward emails to")
+  .option("-g, --group", "Target is a group (default: user/DM)")
+  .option("--from <pattern...>", "Filter by sender (substring match, repeatable)")
+  .option("--subject <pattern...>", "Filter by subject (substring match, repeatable)")
+  .option("--label <label...>", "Filter by Gmail label")
+  .option("--exclude-from <pattern...>", "Exclude emails from these senders")
+  .option("--exclude-subject <pattern...>", "Exclude emails with these subject patterns")
+  .option("--max-age <mins>", "Only forward emails newer than N minutes")
+  .option("--has-attachment", "Only forward emails with attachments")
+  .option("--template <template>", "Custom format template ({from}, {fromName}, {subject}, {snippet}, {body}, {date}, {relativeTime}, {attachmentCount}, {attachmentNames})")
+  .option("-j, --json", "JSON output")
+  .description("Add a routing rule: which emails go to which Zalo chat/group")
+  .action(
+    wrapAction(async (
+      opts: {
+        name: string;
+        target: string;
+        group?: boolean;
+        from?: string[];
+        subject?: string[];
+        label?: string[];
+        excludeFrom?: string[];
+        excludeSubject?: string[];
+        maxAge?: string;
+        hasAttachment?: boolean;
+        template?: string;
+        json?: boolean;
+      },
+      command: Command,
+    ) => {
+      const profile = await currentProfile(command);
+      const config = await readGmailConfig(profile);
+      if (!config) {
+        console.error("Error: Gmail not configured. Run 'gmail setup' first.");
+        process.exitCode = 1;
+        return;
+      }
+
+      const route: GmailRoute = {
+        id: generateRouteId(),
+        name: opts.name,
+        filters: {
+          from: opts.from,
+          subject: opts.subject,
+          labels: opts.label,
+          excludeFrom: opts.excludeFrom,
+          excludeSubject: opts.excludeSubject,
+          maxAgeMins: opts.maxAge ? Number(opts.maxAge) : undefined,
+          hasAttachment: opts.hasAttachment,
+        },
+        target: {
+          threadId: opts.target,
+          isGroup: Boolean(opts.group),
+        },
+        enabled: true,
+        createdAt: new Date().toISOString(),
+        formatTemplate: opts.template,
+      };
+
+      config.routes.push(route);
+      config.updatedAt = new Date().toISOString();
+      await writeGmailConfig(profile, config);
+
+      output(route, shouldOutputJson(opts));
+    }),
+  );
+
+gmail
+  .command("list-routes")
+  .option("-j, --json", "JSON output")
+  .description("List all configured email routing rules")
+  .action(
+    wrapAction(async (opts: { json?: boolean }, command: Command) => {
+      const profile = await currentProfile(command);
+      const config = await readGmailConfig(profile);
+      if (!config) {
+        output([], shouldOutputJson(opts));
+        return;
+      }
+      output(config.routes, shouldOutputJson(opts));
+    }),
+  );
+
+gmail
+  .command("remove-route <routeId>")
+  .option("-j, --json", "JSON output")
+  .description("Remove a routing rule by ID")
+  .action(
+    wrapAction(async (routeId: string, opts: { json?: boolean }, command: Command) => {
+      const profile = await currentProfile(command);
+      const config = await readGmailConfig(profile);
+      if (!config) {
+        console.error("Error: Gmail not configured.");
+        process.exitCode = 1;
+        return;
+      }
+
+      const before = config.routes.length;
+      config.routes = config.routes.filter((r) => r.id !== routeId);
+      if (config.routes.length === before) {
+        console.error(`Error: Route '${routeId}' not found.`);
+        process.exitCode = 1;
+        return;
+      }
+
+      config.updatedAt = new Date().toISOString();
+      await writeGmailConfig(profile, config);
+      output({ removed: routeId, remainingRoutes: config.routes.length }, shouldOutputJson(opts));
+    }),
+  );
+
+gmail
+  .command("toggle-route <routeId>")
+  .option("-j, --json", "JSON output")
+  .description("Enable/disable a routing rule")
+  .action(
+    wrapAction(async (routeId: string, opts: { json?: boolean }, command: Command) => {
+      const profile = await currentProfile(command);
+      const config = await readGmailConfig(profile);
+      if (!config) {
+        console.error("Error: Gmail not configured.");
+        process.exitCode = 1;
+        return;
+      }
+
+      const route = config.routes.find((r) => r.id === routeId);
+      if (!route) {
+        console.error(`Error: Route '${routeId}' not found.`);
+        process.exitCode = 1;
+        return;
+      }
+
+      route.enabled = !route.enabled;
+      config.updatedAt = new Date().toISOString();
+      await writeGmailConfig(profile, config);
+      output({ id: route.id, name: route.name, enabled: route.enabled }, shouldOutputJson(opts));
+    }),
+  );
+
+gmail
+  .command("test")
+  .option("-n, --count <n>", "Number of recent emails to show (default 5)")
+  .option("-j, --json", "JSON output")
+  .description("Test Gmail connection and show recent inbox emails")
+  .action(
+    wrapAction(async (opts: { count?: string; json?: boolean }, command: Command) => {
+      const profile = await currentProfile(command);
+      const config = await readGmailConfig(profile);
+      if (!config) {
+        console.error("Error: Gmail not configured. Run 'gmail setup' first.");
+        process.exitCode = 1;
+        return;
+      }
+
+      const oauth = await refreshAccessToken(config.oauth);
+      config.oauth = oauth;
+      await writeGmailConfig(profile, config);
+
+      const count = opts.count ? Number(opts.count) : 5;
+      const messageRefs = await listNewMessages(oauth.accessToken!, count);
+
+      if (messageRefs.length === 0) {
+        output({ message: "No emails in inbox", count: 0 }, shouldOutputJson(opts));
+        return;
+      }
+
+      const emails: ParsedEmail[] = [];
+      for (const ref of messageRefs) {
+        const email = await getMessage(oauth.accessToken!, ref.id);
+        emails.push(email);
+      }
+
+      // Show which routes would match
+      const results = emails.map((email) => {
+        const validation = validateEmail(email);
+        const matchingRoutes = findMatchingRoutes(email, config.routes);
+        return {
+          messageId: email.messageId,
+          from: email.from,
+          fromName: email.fromName,
+          subject: email.subject,
+          date: email.date,
+          snippet: email.snippet.slice(0, 100),
+          labels: email.labels,
+          hasAttachment: email.hasAttachment,
+          validation: validation,
+          matchingRoutes: matchingRoutes.map((r) => ({ id: r.id, name: r.name, target: r.target })),
+        };
+      });
+
+      output(results, shouldOutputJson(opts));
+    }),
+  );
+
+gmail
+  .command("poll")
+  .option("-k, --keep-alive", "Keep polling (long-running mode)")
+  .option("--once", "Poll once and exit")
+  .option("--dry-run", "Show what would be sent without actually sending")
+  .option("--mark-read", "Mark forwarded emails as read in Gmail")
+  .option("--interval <ms>", "Override poll interval (ms)")
+  .option("-r, --raw", "Output raw JSON events per forwarded email")
+  .option("-j, --json", "JSON output")
+  .description("Poll Gmail inbox and auto-forward matching emails to Zalo")
+  .action(
+    wrapAction(async (
+      opts: {
+        keepAlive?: boolean;
+        once?: boolean;
+        dryRun?: boolean;
+        markRead?: boolean;
+        interval?: string;
+        raw?: boolean;
+        json?: boolean;
+      },
+      command: Command,
+    ) => {
+      const { api, profile } = await requireApi(command);
+      const config = await readGmailConfig(profile);
+      if (!config) {
+        console.error("Error: Gmail not configured. Run 'gmail setup' first.");
+        process.exitCode = 1;
+        return;
+      }
+
+      if (config.routes.length === 0) {
+        console.error("Error: No routes configured. Run 'gmail add-route' first.");
+        process.exitCode = 1;
+        return;
+      }
+
+      const enabledRoutes = config.routes.filter((r) => r.enabled);
+      if (enabledRoutes.length === 0) {
+        console.error("Error: All routes are disabled.");
+        process.exitCode = 1;
+        return;
+      }
+
+      const pollIntervalMs = opts.interval
+        ? Number(opts.interval)
+        : Number(process.env.OPENZCA_GMAIL_POLL_INTERVAL_MS || config.pollIntervalMs);
+      const maxPerPoll = config.maxEmailsPerPoll;
+
+      writeDebugLine("gmail.poll.start", { profile, pollIntervalMs, maxPerPoll, routeCount: enabledRoutes.length, dryRun: opts.dryRun }, command);
+
+      let running = true;
+      let pollTimer: ReturnType<typeof setTimeout> | null = null;
+
+      const unregisterCleanup = registerShutdownCallback(() => {
+        running = false;
+        if (pollTimer) {
+          clearTimeout(pollTimer);
+          pollTimer = null;
+        }
+      });
+
+      const doPoll = async (): Promise<number> => {
+        let forwarded = 0;
+        try {
+          // Refresh token
+          config.oauth = await refreshAccessToken(config.oauth);
+          await writeGmailConfig(profile, config);
+
+          const state = await readGmailPollState(profile);
+          const processedSet = new Set(state.processedMessageIds);
+
+          // Fetch inbox messages
+          const messageRefs = await listNewMessages(config.oauth.accessToken!, maxPerPoll);
+          writeDebugLine("gmail.poll.fetched", { count: messageRefs.length }, command);
+
+          for (const ref of messageRefs) {
+            if (!running) break;
+            if (processedSet.has(ref.id)) continue;
+
+            const email = await getMessage(config.oauth.accessToken!, ref.id);
+
+            // Validate email
+            const validation = validateEmail(email);
+            if (!validation.valid) {
+              writeDebugLine("gmail.poll.invalid", { messageId: email.messageId, reasons: validation.reasons }, command);
+              state.processedMessageIds.push(ref.id);
+              continue;
+            }
+
+            // Find matching routes
+            const matchingRoutes = findMatchingRoutes(email, enabledRoutes);
+            if (matchingRoutes.length === 0) {
+              state.processedMessageIds.push(ref.id);
+              continue;
+            }
+
+            // Forward to each matching route
+            for (const route of matchingRoutes) {
+              const message = formatEmailForZalo(email, route);
+              const threadType = route.target.isGroup ? ThreadType.Group : ThreadType.User;
+
+              if (opts.dryRun) {
+                const event = {
+                  type: "gmail.dry_run",
+                  emailId: email.messageId,
+                  from: email.from,
+                  subject: email.subject,
+                  routeId: route.id,
+                  routeName: route.name,
+                  targetThreadId: route.target.threadId,
+                  targetIsGroup: route.target.isGroup,
+                  message: message.slice(0, 200) + (message.length > 200 ? "..." : ""),
+                };
+                if (opts.raw) {
+                  console.log(JSON.stringify(event));
+                } else {
+                  console.error(`[DRY RUN] Would send to ${route.target.threadId}: ${email.subject}`);
+                }
+              } else {
+                try {
+                  await api.sendMessage(message, route.target.threadId, threadType);
+                  forwarded++;
+
+                  const event = {
+                    type: "gmail.forwarded",
+                    emailId: email.messageId,
+                    from: email.from,
+                    subject: email.subject,
+                    routeId: route.id,
+                    routeName: route.name,
+                    targetThreadId: route.target.threadId,
+                    sentAt: new Date().toISOString(),
+                  };
+
+                  if (opts.raw) {
+                    console.log(JSON.stringify(event));
+                  } else {
+                    console.error(`Forwarded: "${email.subject}" from ${email.from} → ${route.name} (${route.target.threadId})`);
+                  }
+
+                  writeDebugLine("gmail.poll.forwarded", event, command);
+                } catch (sendErr) {
+                  const errMsg = sendErr instanceof Error ? sendErr.message : String(sendErr);
+                  console.error(`Error sending to ${route.target.threadId}: ${errMsg}`);
+                  writeDebugLine("gmail.poll.send_error", { messageId: email.messageId, routeId: route.id, error: errMsg }, command);
+                }
+              }
+            }
+
+            // Mark as processed
+            state.processedMessageIds.push(ref.id);
+
+            // Optionally mark as read in Gmail
+            if (opts.markRead && !opts.dryRun) {
+              try {
+                await markAsRead(config.oauth.accessToken!, ref.id);
+              } catch (markErr) {
+                writeDebugLine("gmail.poll.mark_read_error", { messageId: ref.id, error: String(markErr) }, command);
+              }
+            }
+          }
+
+          state.lastPollAtMs = Date.now();
+          await writeGmailPollState(profile, state);
+        } catch (error) {
+          const errMsg = error instanceof Error ? error.message : String(error);
+          console.error(`Poll error: ${errMsg}`);
+          writeDebugLine("gmail.poll.error", { error: errMsg }, command);
+        }
+        return forwarded;
+      };
+
+      try {
+        // Initial poll
+        const count = await doPoll();
+        if (opts.raw) {
+          console.log(JSON.stringify({ type: "gmail.poll.complete", forwarded: count, timestamp: new Date().toISOString() }));
+        }
+
+        if (opts.once || !opts.keepAlive) {
+          return;
+        }
+
+        // Continuous polling
+        console.error(`Gmail polling started. Interval: ${pollIntervalMs}ms. Routes: ${enabledRoutes.length}. Ctrl+C to stop.`);
+
+        await new Promise<void>((resolve) => {
+          const schedulePoll = () => {
+            if (!running) {
+              resolve();
+              return;
+            }
+            pollTimer = setTimeout(async () => {
+              if (!running) {
+                resolve();
+                return;
+              }
+              const c = await doPoll();
+              if (opts.raw) {
+                console.log(JSON.stringify({ type: "gmail.poll.complete", forwarded: c, timestamp: new Date().toISOString() }));
+              }
+              schedulePoll();
+            }, pollIntervalMs);
+          };
+          schedulePoll();
+        });
+      } finally {
+        unregisterCleanup();
+      }
+    }),
+  );
+
+// ---------------------------------------------------------------------------
 // OpenClaw tools integration — tool discovery, execution, and reports
 // ---------------------------------------------------------------------------
 
