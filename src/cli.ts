@@ -75,6 +75,15 @@ import {
   type DbThreadType,
 } from "./lib/db.js";
 import {
+  TOOL_DEFINITIONS,
+  executeToolCall,
+  generateSummaryReport,
+  generateGroupReport,
+  generateActivityReport,
+  generateMemberReport,
+  searchMessages,
+} from "./lib/openclaw-tools.js";
+import {
   createZaloClient,
   loginWithCredentialPayload,
   loginWithQrAndPersist,
@@ -7469,6 +7478,172 @@ program
         }
       },
     ),
+  );
+
+// ---------------------------------------------------------------------------
+// OpenClaw tools integration — tool discovery, execution, and reports
+// ---------------------------------------------------------------------------
+
+const tools = program
+  .command("tools")
+  .description("OpenClaw tool/skill discovery and execution");
+
+tools
+  .command("list")
+  .option("-j, --json", "JSON output")
+  .option("--category <category>", "Filter by category (data, analysis)")
+  .description("List available tools that OpenClaw can invoke")
+  .action(
+    wrapAction(async (opts: { json?: boolean; category?: string }) => {
+      let defs = TOOL_DEFINITIONS;
+      if (opts.category) {
+        defs = defs.filter((t) => t.category === opts.category);
+      }
+      output(defs, shouldOutputJson(opts));
+    }),
+  );
+
+tools
+  .command("call")
+  .argument("<name>", "Tool name to execute")
+  .option("--params <json>", "JSON-encoded parameters", "{}")
+  .option("-j, --json", "JSON output")
+  .description("Execute a tool by name with JSON parameters")
+  .action(
+    wrapAction(async (name: string, opts: { params?: string; json?: boolean }, command: Command) => {
+      const profile = await currentProfile(command);
+      let params: Record<string, unknown> = {};
+      if (opts.params) {
+        try {
+          params = JSON.parse(opts.params) as Record<string, unknown>;
+        } catch {
+          console.error("Error: --params must be valid JSON");
+          process.exitCode = 1;
+          return;
+        }
+      }
+      const result = await executeToolCall(profile, name, params);
+      if (!result.success) {
+        console.error(`Error: ${result.error}`);
+        process.exitCode = 1;
+        return;
+      }
+      output(result.data, shouldOutputJson(opts));
+    }),
+  );
+
+tools
+  .command("schema")
+  .argument("[name]", "Tool name (omit for all)")
+  .option("-j, --json", "JSON output")
+  .description("Show parameter schema for a tool")
+  .action(
+    wrapAction(async (name: string | undefined, opts: { json?: boolean }) => {
+      if (name) {
+        const tool = TOOL_DEFINITIONS.find((t) => t.name === name);
+        if (!tool) {
+          console.error(`Error: Unknown tool '${name}'`);
+          process.exitCode = 1;
+          return;
+        }
+        output(tool, shouldOutputJson(opts));
+      } else {
+        output(TOOL_DEFINITIONS, shouldOutputJson(opts));
+      }
+    }),
+  );
+
+const report = program
+  .command("report")
+  .description("Data analysis and reporting");
+
+report
+  .command("summary")
+  .option("-j, --json", "JSON output")
+  .description("Overall summary: groups, chats, message volume, top active threads")
+  .action(
+    wrapAction(async (opts: { json?: boolean }, command: Command) => {
+      const profile = await currentProfile(command);
+      const data = await generateSummaryReport(profile);
+      output(data, shouldOutputJson(opts));
+    }),
+  );
+
+report
+  .command("group")
+  .argument("<threadId>", "Group thread ID")
+  .option("-j, --json", "JSON output")
+  .option("--since <ms>", "Analyze messages after this Unix timestamp (ms)")
+  .option("--until <ms>", "Analyze messages before this Unix timestamp (ms)")
+  .description("Group activity report: top senders, message types, active hours, daily volume")
+  .action(
+    wrapAction(async (
+      threadId: string,
+      opts: { json?: boolean; since?: string; until?: string },
+      command: Command,
+    ) => {
+      const profile = await currentProfile(command);
+      const sinceMs = opts.since ? Number(opts.since) : undefined;
+      const untilMs = opts.until ? Number(opts.until) : undefined;
+      const data = await generateGroupReport(profile, threadId, sinceMs, untilMs);
+      output(data, shouldOutputJson(opts));
+    }),
+  );
+
+report
+  .command("activity")
+  .option("-j, --json", "JSON output")
+  .option("--days <n>", "Number of past days to analyze (default 7)")
+  .description("Cross-group activity timeline: daily message counts, trending groups")
+  .action(
+    wrapAction(async (opts: { json?: boolean; days?: string }, command: Command) => {
+      const profile = await currentProfile(command);
+      const days = opts.days ? Number(opts.days) : 7;
+      const data = await generateActivityReport(profile, days);
+      output(data, shouldOutputJson(opts));
+    }),
+  );
+
+report
+  .command("member")
+  .argument("<threadId>", "Group thread ID")
+  .option("-j, --json", "JSON output")
+  .option("--since <ms>", "Analyze messages after this Unix timestamp (ms)")
+  .description("Member participation report: per-member message counts, reply rates, media usage")
+  .action(
+    wrapAction(async (
+      threadId: string,
+      opts: { json?: boolean; since?: string },
+      command: Command,
+    ) => {
+      const profile = await currentProfile(command);
+      const sinceMs = opts.since ? Number(opts.since) : undefined;
+      const data = await generateMemberReport(profile, threadId, sinceMs);
+      output(data, shouldOutputJson(opts));
+    }),
+  );
+
+report
+  .command("search")
+  .argument("<query>", "Search query string")
+  .option("-j, --json", "JSON output")
+  .option("--thread <id>", "Limit search to a specific thread")
+  .option("-g, --group", "Search only in group threads")
+  .option("--user", "Search only in user/DM threads")
+  .option("-n, --count <n>", "Max results (default 50)")
+  .description("Search messages across all threads by content text")
+  .action(
+    wrapAction(async (
+      query: string,
+      opts: { json?: boolean; thread?: string; group?: boolean; user?: boolean; count?: string },
+      command: Command,
+    ) => {
+      const profile = await currentProfile(command);
+      const threadType = opts.group ? "group" as const : opts.user ? "user" as const : undefined;
+      const count = opts.count ? Number(opts.count) : 50;
+      const data = await searchMessages(profile, query, opts.thread, threadType, count);
+      output(data, shouldOutputJson(opts));
+    }),
   );
 
 program.parseAsync(normalizeCommandAliases(process.argv));
